@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.4] - Nov 2022
+
+- more flexible AD compatibility
+- included ImplicitAD to speed up derivative computation (minor speed in this case because residual is just 1D, maybe 2x)
+- fixed Reynolds number used in one of the doc examples
+
+## [0.2.3] - Nov 2021
+
+Minor change in how the empirical region is handled based on suggestion from Kenneth Lønbæk.  In effect it is Buhl(F = 1)*F.  This forces CT -> 0 as F -> 0 at the tip.
+
+## [0.2.2] - Aug 2021
+
+- Two bug fixes for AlphaReMachAF functions
 
 ## [0.2.1] - Sep 2020
 

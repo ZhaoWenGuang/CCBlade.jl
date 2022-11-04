@@ -14,6 +14,7 @@ Some unique features:
 module CCBlade
 
 import FLOWMath
+using ImplicitAD
 
 export Rotor, Section, OperatingPoint, Outputs
 export simple_op, windturbine_op
@@ -71,20 +72,24 @@ Define sectional properties for one station along rotor
 - `theta::Float64`: corresponding twist angle (radians)
 - `af::Function or AFType`: if function form is: `cl, cd = af(alpha, Re, Mach)`
 """
-struct Section{TF1, TF2, TF3, TAF}
-    r::TF1  # different types b.c. of dual numbers.  often r is fixed, while chord/theta vary.
-    chord::TF2
-    theta::TF3
+struct Section{TF, TAF}
+    r::TF
+    chord::TF
+    theta::TF
     af::TAF
 end  
 
+# promote to same type, e.g., duals
+function Section(r, chord, theta, af)
+    r, chord, theta = promote(r, chord, theta)
+    return Section(r, chord, theta, af)
+end
 
 
 # convenience function to access fields within an array of structs
-function Base.getproperty(obj::Vector{Section{TF1, TF2, TF3, TAF}}, sym::Symbol) where {TF1, TF2, TF3, TAF}
+function Base.getproperty(obj::AbstractVector{<:Section}, sym::Symbol)
     return getfield.(obj, sym)
 end # This is not always type stable b/c we don't know if the return type will be float or af function.
-
 
 """
     OperatingPoint(Vx, Vy, rho; pitch=0.0, mu=1.0, asound=1.0)
@@ -102,20 +107,24 @@ See Documentation for more detail on coordinate systems.
 - `mu::Float64`: fluid dynamic viscosity (unused if Re not included in airfoil data)
 - `asound::Float64`: fluid speed of sound (unused if Mach not included in airfoil data)
 """
-struct OperatingPoint{TF1, TF2, TF3, TF4, TF5}
-    Vx::TF1
-    Vy::TF1
-    rho::TF2  # different type to accomodate ReverseDiff
-    pitch::TF3  
-    mu::TF4
-    asound::TF5
+struct OperatingPoint{TF}
+    Vx::TF
+    Vy::TF
+    rho::TF
+    pitch::TF  
+    mu::TF
+    asound::TF
 end
 
+# promote to same type, e.g., duals
+OperatingPoint(Vx, Vy, rho, pitch, mu, asound) = OperatingPoint(promote(Vx, Vy, rho, pitch, mu, asound)...)
+
+
 # convenience constructor when Re and Mach are not used.
-OperatingPoint(Vx, Vy, rho) = OperatingPoint(Vx, Vy, rho; pitch=zero(rho), mu=one(rho), asound=one(rho)) 
+OperatingPoint(Vx, Vy, rho; pitch=zero(rho), mu=one(rho), asound=one(rho)) = OperatingPoint(Vx, Vy, rho, pitch, mu, asound)
 
 # convenience function to access fields within an array of structs
-function Base.getproperty(obj::Vector{OperatingPoint{TF1, TF2, TF3, TF4, TF5}}, sym::Symbol) where {TF1, TF2, TF3, TF4, TF5}
+function Base.getproperty(obj::AbstractVector{<:OperatingPoint}, sym::Symbol)
     return getfield.(obj, sym)
 end
 
@@ -160,11 +169,14 @@ struct Outputs{TF}
     G::TF
 end
 
+# promote to same type, e.g., duals
+Outputs(Np, Tp, a, ap, u, v, phi, alpha, W, cl, cd, cn, ct, F, G) = Outputs(promote(Np, Tp, a, ap, u, v, phi, alpha, W, cl, cd, cn, ct, F, G)...)
+
 # convenience constructor to initialize
 Outputs() = Outputs(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 # convenience function to access fields within an array of structs
-function Base.getproperty(obj::Vector{Outputs{TF}}, sym::Symbol) where TF
+function Base.getproperty(obj::AbstractVector{<:Outputs}, sym::Symbol)
     return getfield.(obj, sym)
 end
 
@@ -178,22 +190,11 @@ end
 """
 (private) residual function
 """
-function residual(phi, rotor, section, op)
+function residual_and_outputs(phi, x, p)  #rotor, section, op)
 
     # unpack inputs
-    r = section.r
-    chord = section.chord
-    theta = section.theta
-    af = section.af
-
-    Rhub = rotor.Rhub
-    Rtip = rotor.Rtip
-    B = rotor.B
-    
-    Vx = op.Vx
-    Vy = op.Vy
-    rho = op.rho
-    pitch = op.pitch
+    r, chord, theta, Rhub, Rtip, Vx, Vy, rho, pitch, mu, asound = x  # variables
+    af, B, turbine, re_corr, mach_corr, rotation_corr, tip_corr = p  # parameters
     
     # constants
     sigma_p = B*chord/(2.0*pi*r)
@@ -205,11 +206,11 @@ function residual(phi, rotor, section, op)
 
     # Reynolds/Mach number
     W0 = sqrt(Vx^2 + Vy^2)  # ignoring induction, which is generally a very minor difference and only affects Reynolds/Mach number
-    Re = rho * W0 * chord / op.mu
-    Mach = W0/op.asound  # also ignoring induction
+    Re = rho * W0 * chord / mu
+    Mach = W0/asound  # also ignoring induction
 
     # airfoil cl/cd
-    if rotor.turbine
+    if turbine
         cl, cd = afeval(af, -alpha, Re, Mach)
         cl *= -1
     else
@@ -217,14 +218,14 @@ function residual(phi, rotor, section, op)
     end
 
     # airfoil corrections
-    if !isnothing(rotor.re)
-        cl, cd = re_correction(rotor.re, cl, cd, Re)
+    if !isnothing(re_corr)
+        cl, cd = re_correction(re_corr, cl, cd, Re)
     end
-    if !isnothing(rotor.mach)
-        cl, cd = mach_correction(rotor.mach, cl, cd, Mach)
+    if !isnothing(mach_corr)
+        cl, cd = mach_correction(mach_corr, cl, cd, Mach)
     end
-    if !isnothing(rotor.rotation)
-        cl, cd = rotation_correction(rotor.rotation, cl, cd, chord/r, r/Rtip, Vy/Vx*Rtip/r, alpha, phi)
+    if !isnothing(rotation_corr)
+        cl, cd = rotation_correction(rotation_corr, cl, cd, chord/r, r/Rtip, Vy/Vx*Rtip/r, alpha, phi)
     end
 
     # resolve into normal and tangential forces
@@ -233,8 +234,8 @@ function residual(phi, rotor, section, op)
 
     # hub/tip loss
     F = 1.0
-    if !isnothing(rotor.tip)
-        F = tip_correction(rotor.tip, r, Rhub, Rtip, phi, B)   
+    if !isnothing(tip_corr)
+        F = tip_correction(tip_corr, r, Rhub, Rtip, phi, B)   
     end
 
     # sec parameters
@@ -271,16 +272,13 @@ function residual(phi, rotor, section, op)
         if k >= -2.0/3  # momentum region
             a = k/(1 - k)
 
-        else  # empirical region
-            g1 = F*(2*k - 1) + 10.0/9
-            g2 = F*(F - 2*k - 4.0/3)
-            g3 = 2*F*(1 - k) - 25.0/9
-
-            if isapprox(g3, 0.0, atol=1e-6)  # avoid singularity
-                a = 1.0/(2.0*sqrt(g2)) - 1
-            else
-                a = (g1 + sqrt(g2)) / g3
-            end
+        else  # empirical region. Not Buhl's correction but instead uses Buhl with F = 1 then multiplied by F.  
+            # (Buhl(F = 1)*F).  The original method does not force CT -> 0 as f->0.  This can be problematic if 
+            # using CT/CP directly as a design variables.  Suggestion courtesy of Kenneth Lønbæk.
+            g1 = 2*k + 1.0/9
+            g2 = -2*k - 1.0/3
+            g3 = -2*k - 7.0/9
+            a = (g1 + sqrt(g2)) / g3
         end
 
         u = a * Vx
@@ -326,7 +324,7 @@ function residual(phi, rotor, section, op)
     u *= G
     v *= G
 
-    if rotor.turbine
+    if turbine
         return R, Outputs(-Np, -Tp, -a, -ap, -u, -v, phi, -alpha, W, -cl, cd, -cn, -ct, F, G)
     else
         return R, Outputs(Np, Tp, a, ap, u, v, phi, alpha, W, cl, cd, cn, ct, F, G)
@@ -384,8 +382,8 @@ Solve the BEM equations for given rotor geometry and operating point.
 function solve(rotor, section, op)
 
     # error handling
-    if typeof(section) <: Vector
-        error("You passed in an vector for section, but this funciton does not accept an vector.\nProbably you intended to use broadcasting (notice the dot): solve.(Ref(rotor), sections, ops)")
+    if typeof(section) <: AbstractVector
+        error("You passed in an vector for section, but this function does not accept an vector.\nProbably you intended to use broadcasting (notice the dot): solve.(Ref(rotor), sections, ops)")
     end
 
     # check if we are at hub/tip
@@ -459,12 +457,13 @@ function solve(rotor, section, op)
 
     end
 
-        
-
     # ----- solve residual function ------
+    # pull out first argument
+    residual(phi, x, p) = residual_and_outputs(phi, x, p)[1]
 
-    # # wrapper to residual function to accomodate format required by fzero
-    R(phi) = residual(phi, rotor, section, op)[1]
+    # package up variables and parameters for residual
+    xv = [section.r, section.chord, section.theta, rotor.Rhub, rotor.Rtip, op.Vx, op.Vy, op.rho, op.pitch, op.mu, op.asound]
+    pv = (section.af, rotor.B, rotor.turbine, rotor.re, rotor.mach, rotor.rotation, rotor.tip)
 
     success = false
     for j = 1:length(order)  # quadrant orders.  In most cases it should find root in first quadrant searched.
@@ -481,18 +480,19 @@ function solve(rotor, section, op)
                 backwardsearch = true
             end
         end
-        
-        # force to dual numbers if necessary
-        phimin = phimin*one(section.chord)
-        phimax = phimax*one(section.chord)
 
         # find bracket
-        success, phiL, phiU = firstbracket(R, phimin, phimax, npts, backwardsearch)
+        success, phiL, phiU = firstbracket(phi -> residual(phi, xv, pv), phimin, phimax, npts, backwardsearch)
+
+        function solve(x, p)
+            phistar, _ = FLOWMath.brent(phi -> residual(phi, x, p), phiL, phiU)
+            return phistar
+        end
 
         # once bracket is found, solve root finding problem and compute loads
         if success
-            phistar, _ = FLOWMath.brent(R, phiL, phiU)
-            _, outputs = residual(phistar, rotor, section, op)
+            phistar = implicit(solve, residual, xv, pv)
+            _, outputs = residual_and_outputs(phistar, xv, pv)
             return outputs
         end    
     end    
@@ -529,7 +529,7 @@ Uniform inflow through rotor.  Returns an OperatingPoint object.
 function simple_op(Vinf, Omega, r, rho; pitch=zero(rho), mu=one(rho), asound=one(rho), precone=zero(Vinf))
 
     # error handling
-    if typeof(r) <: Vector
+    if typeof(r) <: AbstractVector
         error("You passed in an vector for r, but this function does not accept an vector.\nProbably you intended to use broadcasting")
     end
 
@@ -606,7 +606,7 @@ end
 # -------- convenience methods ------------
 
 """
-    thrusttorque(rotor, sections, outputs::Vector{TO}) where TO
+    thrusttorque(rotor, sections, outputs::AbstractVector{TO}) where TO
 
 integrate the thrust/torque across the blade, 
 including 0 loads at hub/tip, using a trapezoidal rule.
@@ -620,7 +620,7 @@ including 0 loads at hub/tip, using a trapezoidal rule.
 - `T::Float64`: thrust (along x-dir see Documentation).
 - `Q::Float64`: torque (along x-dir see Documentation).
 """
-function thrusttorque(rotor, sections, outputs::Vector{TO}) where TO
+function thrusttorque(rotor, sections, outputs::AbstractVector{TO}) where TO
 
     # add hub/tip for complete integration.  loads go to zero at hub/tip.
     rvec = [s.r for s in sections]
@@ -640,13 +640,13 @@ end
 
 
 """
-    thrusttorque(rotor, sections, outputs::Matrix{TO}) where TO
+    thrusttorque(rotor, sections, outputs::AbstractMatrix{TO}) where TO
 
 Integrate the thrust/torque across the blade given an array of output data.
 Generally used for azimuthal averaging of thrust/torque.
 `outputs[i, j]` corresponds to `sections[i], azimuth[j]`.  Integrates across azimuth
 """
-function thrusttorque(rotor, sections, outputs::Matrix{TO}) where TO
+function thrusttorque(rotor, sections, outputs::AbstractMatrix{TO}) where TO
 
     T = 0.0
     Q = 0.0
